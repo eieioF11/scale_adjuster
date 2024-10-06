@@ -22,6 +22,14 @@
 #include <sensor_msgs/point_cloud_conversion.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 #include <std_msgs/msg/float32.hpp>
+#include <geometry_msgs/msg/transform.hpp>
+// tf2
+#include <tf2/utils.h>
+#include <tf2_eigen/tf2_eigen.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
 // OpenMP
 #include <omp.h>
 // OpenCV
@@ -53,9 +61,10 @@ public:
   ScaleAdjuster(
       const std::string &name_space = "",
       const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
-      : rclcpp::Node("scale_adjuster_node", name_space, options)
+      : rclcpp::Node("scale_adjuster_node", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_)
   {
     RCLCPP_INFO(this->get_logger(), "start scale_adjuster_node");
+    BASE_FRAME = param<std::string>("scale_adjuster.base_frame", "base_link");
     VOXEL_SIZE = param<double>("scale_adjuster.voxel_size", 700.0);
     H_RANGE = param<double>("scale_adjuster.h_range", 1000.0);
     RANSAC_THRESHOLD = param<double>("scale_adjuster.ransac_threshold", 300.0);
@@ -70,14 +79,22 @@ public:
         "in_points", rclcpp::QoS(10),
         [&](const sensor_msgs::msg::PointCloud2::SharedPtr msg)
         {
+          auto camera_link_tf = lookup_transform(tf_buffer_, msg->header.frame_id, BASE_FRAME);
+          double camera_h = 0.0;
+          if (camera_link_tf)
+          {
+            auto transform = camera_link_tf.value().transform;
+            // std::cout << "camera_link_tf:" << transform.translation.x << "," << transform.translation.y << "," << transform.translation.z << std::endl;
+            camera_h = transform.translation.z;
+          }
           cloud_header_ = msg->header;
           pcl::PointCloud<pcl::PointXYZ> cloud;
           pcl::fromROSMsg(*msg, cloud);
           cloud = voxelgrid_filter(cloud, VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
           // スケール計算
           double scale = calc_scale(cloud, 1.0);
-          // スケール補正
-          #pragma omp parallel for schedule(dynamic)
+// スケール補正
+#pragma omp parallel for schedule(dynamic)
           for (auto &p : cloud.points)
           {
             p.x *= scale;
@@ -90,6 +107,7 @@ public:
   }
 
 private:
+  std::string BASE_FRAME;
   double H_RANGE;
   double VOXEL_SIZE;
   double RANSAC_THRESHOLD;
@@ -100,24 +118,11 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr scale_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr plane_cloud_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr filtered_cloud_pub_;
+  // tf
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener listener_;
 
   std_msgs::msg::Header cloud_header_;
-
-  template <class T>
-  T param(const std::string &name, const T &def)
-  {
-    T value;
-    declare_parameter(name, def);
-    get_parameter(name, value);
-    return value;
-  }
-
-  template <typename FLOATING_TYPE = double>
-  inline std_msgs::msg::Float32 make_float32(const FLOATING_TYPE& val) {
-    std_msgs::msg::Float32 msg;
-    msg.data = val;
-    return msg;
-  }
 
   template <typename POINT_TYPE = pcl::PointXYZ>
   double calc_scale(const pcl::PointCloud<POINT_TYPE> &in_cloud, double camera_h)
@@ -153,6 +158,45 @@ private:
     return scale;
   }
 
+  // utility functions
+  template <class T>
+  T param(const std::string &name, const T &def)
+  {
+    T value;
+    declare_parameter(name, def);
+    get_parameter(name, value);
+    return value;
+  }
+
+  template <typename FLOATING_TYPE = double>
+  inline std_msgs::msg::Float32 make_float32(const FLOATING_TYPE &val)
+  {
+    std_msgs::msg::Float32 msg;
+    msg.data = val;
+    return msg;
+  }
+
+  inline std::optional<geometry_msgs::msg::TransformStamped> lookup_transform(const tf2_ros::Buffer &buffer, const std::string &source_frame,
+                                                                              const std::string &target_frame,
+                                                                              const rclcpp::Time &time = rclcpp::Time(0),
+                                                                              const tf2::Duration timeout = tf2::durationFromSec(0.0))
+  {
+    std::optional<geometry_msgs::msg::TransformStamped> ret = std::nullopt;
+    try
+    {
+      ret = buffer.lookupTransform(target_frame, source_frame, time, timeout);
+    }
+    catch (tf2::LookupException &ex)
+    {
+      std::cerr << "[ERROR]" << ex.what() << std::endl;
+    }
+    catch (tf2::ExtrapolationException &ex)
+    {
+      std::cerr << "[ERROR]" << ex.what() << std::endl;
+    }
+    return ret;
+  }
+
   template <typename POINT_TYPE = pcl::PointXYZ>
   inline pcl::PointCloud<POINT_TYPE> voxelgrid_filter(const pcl::PointCloud<POINT_TYPE> &input_cloud, double lx, double ly, double lz)
   {
@@ -165,8 +209,9 @@ private:
   }
 
   template <typename POINT_TYPE = pcl::PointXYZ>
-  inline pcl::PointCloud<POINT_TYPE> passthrough_filter(std::string field, const pcl::PointCloud<POINT_TYPE>& input_cloud, double min,
-                                                           double max) {
+  inline pcl::PointCloud<POINT_TYPE> passthrough_filter(std::string field, const pcl::PointCloud<POINT_TYPE> &input_cloud, double min,
+                                                        double max)
+  {
     pcl::PointCloud<POINT_TYPE> output_cloud;
     pcl::PassThrough<POINT_TYPE> pass;
     pass.setFilterFieldName(field);
@@ -177,7 +222,8 @@ private:
   }
 
   template <typename POINT_TYPE = pcl::PointXYZ>
-  inline std::pair<pcl::PointIndices::Ptr, pcl::ModelCoefficients::Ptr> ransac(const pcl::PointCloud<POINT_TYPE>& cloud, double threshold = 0.5) {
+  inline std::pair<pcl::PointIndices::Ptr, pcl::ModelCoefficients::Ptr> ransac(const pcl::PointCloud<POINT_TYPE> &cloud, double threshold = 0.5)
+  {
     // 平面検出
     // 平面方程式と平面と検出された点のインデックス
     pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
@@ -194,11 +240,13 @@ private:
   }
 
   template <typename POINT_TYPE = pcl::PointXYZ>
-  inline pcl::PointCloud<POINT_TYPE> extract_cloud(const pcl::PointCloud<POINT_TYPE>& cloud, pcl::PointIndices::Ptr inliers,
-                                                    bool negative = false) {
+  inline pcl::PointCloud<POINT_TYPE> extract_cloud(const pcl::PointCloud<POINT_TYPE> &cloud, pcl::PointIndices::Ptr inliers,
+                                                   bool negative = false)
+  {
     pcl::PointCloud<POINT_TYPE> extrac_cloud;
     pcl::ExtractIndices<POINT_TYPE> extract;
-    if (inliers->indices.size() == 0) return extrac_cloud;
+    if (inliers->indices.size() == 0)
+      return extrac_cloud;
     extract.setInputCloud(cloud.makeShared());
     extract.setIndices(inliers);
     extract.setNegative(negative);
