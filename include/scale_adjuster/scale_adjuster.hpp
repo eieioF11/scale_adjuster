@@ -66,8 +66,8 @@ public:
     RCLCPP_INFO(this->get_logger(), "start scale_adjuster_node");
     BASE_FRAME = param<std::string>("scale_adjuster.base_frame", "base_link");
     VOXEL_SIZE = param<double>("scale_adjuster.voxel_size", 700.0);
-    H_RANGE = param<double>("scale_adjuster.h_range", 1000.0);
-    RANSAC_THRESHOLD = param<double>("scale_adjuster.ransac_threshold", 300.0);
+    CUT_RANGE = param<double>("scale_adjuster.cut_range", 0.1); // 0~1 (床面から何％の点を抜き取るか(1がすべての点を使用))
+    RANSAC_THRESHOLD = param<double>("scale_adjuster.ransac_threshold", 500.0);
     cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
         "out_points", rclcpp::QoS(10));
     scale_pub_ = this->create_publisher<std_msgs::msg::Float32>("scale_adjuster/scale", rclcpp::QoS(10));
@@ -108,7 +108,7 @@ public:
 
 private:
   std::string BASE_FRAME;
-  double H_RANGE;
+  double CUT_RANGE;
   double VOXEL_SIZE;
   double RANSAC_THRESHOLD;
   // subscriber
@@ -129,7 +129,12 @@ private:
   {
     pcl::PointCloud<POINT_TYPE> out_cloud = in_cloud;
     // filtering points
-    pcl::PointCloud<POINT_TYPE> cut_cloud = passthrough_filter<POINT_TYPE>("y", in_cloud, -(camera_h + H_RANGE), 1000000.0);
+		pcl::PointXYZ min_p, max_p;
+		pcl::getMinMax3D (in_cloud, min_p, max_p);
+    double diff_y = max_p.y - min_p.y;
+    double cut_y = max_p.y - diff_y * CUT_RANGE;
+    // filtering points
+    pcl::PointCloud<POINT_TYPE> cut_cloud = passthrough_filter<POINT_TYPE>("y", in_cloud, cut_y , max_p.y);
     // plane detection
     auto [inliers, coefficients] = ransac<POINT_TYPE>(cut_cloud, RANSAC_THRESHOLD);
     pcl::PointCloud<POINT_TYPE> plane_cloud = extract_cloud<POINT_TYPE>(cut_cloud, inliers);
