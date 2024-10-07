@@ -23,6 +23,12 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <std_msgs/msg/float32.hpp>
 #include <geometry_msgs/msg/transform.hpp>
+// extention node
+#include "extension_node/extension_node.hpp"
+// common_utils
+#define USE_PCL
+#define USE_ROS2
+#include "common_utils/common_utils.hpp"
 // tf2
 #include <tf2/utils.h>
 #include <tf2_eigen/tf2_eigen.h>
@@ -35,33 +41,17 @@
 // OpenCV
 #include <opencv2/opencv.hpp>
 #include "cv_bridge/cv_bridge.h"
-// PCL
-#include <pcl/point_cloud.h>
-#include <pcl/common/common.h>
-#include <pcl/common/transforms.h>
-#include <pcl/conversions.h>
-#include <pcl/features/normal_3d_omp.h>
-#include <pcl/filters/approximate_voxel_grid.h>
-#include <pcl/filters/extract_indices.h>
-#include <pcl/filters/passthrough.h>
-#include <pcl/filters/radius_outlier_removal.h>
-#include <pcl/filters/voxel_grid.h>
-#include <pcl/point_cloud.h>
-#include <pcl/point_types.h>
-#include <pcl/segmentation/sac_segmentation.h>
-#include <pcl/visualization/cloud_viewer.h>
-#include <pcl_conversions/pcl_conversions.h>
 
 using namespace std::chrono_literals;
 
-class ScaleAdjuster : public rclcpp::Node
+class ScaleAdjuster : public ext_rclcpp::ExtensionNode
 {
 public:
   ScaleAdjuster(const rclcpp::NodeOptions &options) : ScaleAdjuster("", options) {}
   ScaleAdjuster(
       const std::string &name_space = "",
       const rclcpp::NodeOptions &options = rclcpp::NodeOptions())
-      : rclcpp::Node("scale_adjuster_node", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_)
+      : ext_rclcpp::ExtensionNode("scale_adjuster_node", name_space, options), tf_buffer_(this->get_clock()), listener_(tf_buffer_)
   {
     RCLCPP_INFO(this->get_logger(), "start scale_adjuster_node");
     BASE_FRAME = param<std::string>("scale_adjuster.base_frame", "base_link");
@@ -79,7 +69,7 @@ public:
         "in_points", rclcpp::QoS(10),
         [&](const sensor_msgs::msg::PointCloud2::SharedPtr msg)
         {
-          auto camera_link_tf = lookup_transform(tf_buffer_, msg->header.frame_id, BASE_FRAME);
+          auto camera_link_tf = ros2_utils::lookup_transform(tf_buffer_, msg->header.frame_id, BASE_FRAME);
           double camera_h = 0.0;
           if (camera_link_tf)
           {
@@ -90,7 +80,7 @@ public:
           cloud_header_ = msg->header;
           pcl::PointCloud<pcl::PointXYZ> cloud;
           pcl::fromROSMsg(*msg, cloud);
-          cloud = voxelgrid_filter(cloud, VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
+          cloud = pcl_utils::voxelgrid_filter(cloud, VOXEL_SIZE, VOXEL_SIZE, VOXEL_SIZE);
           // スケール計算
           double scale = calc_scale(cloud, 1.0);
 // スケール補正
@@ -101,8 +91,8 @@ public:
             p.y *= scale;
             p.z *= scale;
           }
-          cloud_pub_->publish(make_ros_pointcloud2(msg->header, cloud));
-          scale_pub_->publish(make_float32(scale));
+          cloud_pub_->publish(ros2_utils::make_ros_pointcloud2(msg->header, cloud));
+          scale_pub_->publish(ros2_utils::make_float32(scale));
         });
   }
 
@@ -134,10 +124,10 @@ private:
     double diff_y = max_p.y - min_p.y;
     double cut_y = max_p.y - diff_y * CUT_RANGE;
     // filtering points
-    pcl::PointCloud<POINT_TYPE> cut_cloud = passthrough_filter<POINT_TYPE>("y", in_cloud, cut_y , max_p.y);
+    pcl::PointCloud<POINT_TYPE> cut_cloud = pcl_utils::passthrough_filter<POINT_TYPE>("y", in_cloud, cut_y , max_p.y);
     // plane detection
-    auto [inliers, coefficients] = ransac<POINT_TYPE>(cut_cloud, RANSAC_THRESHOLD);
-    pcl::PointCloud<POINT_TYPE> plane_cloud = extract_cloud<POINT_TYPE>(cut_cloud, inliers);
+    auto [inliers, coefficients] = pcl_utils::ransac<POINT_TYPE>(cut_cloud, RANSAC_THRESHOLD);
+    pcl::PointCloud<POINT_TYPE> plane_cloud = pcl_utils::extract_cloud<POINT_TYPE>(cut_cloud, inliers);
     Eigen::Vector3d normal(coefficients->values[0], coefficients->values[1], coefficients->values[2]);
     normal.normalize();
     std::cout << "normal:" << normal.transpose() << std::endl;
@@ -158,113 +148,8 @@ private:
     std::cout << "h_median:" << h_median << std::endl;
     // calc scale
     double scale = camera_h / std::abs(h_median);
-    plane_cloud_pub_->publish(make_ros_pointcloud2(cloud_header_, plane_cloud));
-    filtered_cloud_pub_->publish(make_ros_pointcloud2(cloud_header_, cut_cloud));
+    plane_cloud_pub_->publish(ros2_utils::make_ros_pointcloud2(cloud_header_, plane_cloud));
+    filtered_cloud_pub_->publish(ros2_utils::make_ros_pointcloud2(cloud_header_, cut_cloud));
     return scale;
-  }
-
-  // utility functions
-  template <class T>
-  T param(const std::string &name, const T &def)
-  {
-    T value;
-    declare_parameter(name, def);
-    get_parameter(name, value);
-    return value;
-  }
-
-  template <typename FLOATING_TYPE = double>
-  inline std_msgs::msg::Float32 make_float32(const FLOATING_TYPE &val)
-  {
-    std_msgs::msg::Float32 msg;
-    msg.data = val;
-    return msg;
-  }
-
-  inline std::optional<geometry_msgs::msg::TransformStamped> lookup_transform(const tf2_ros::Buffer &buffer, const std::string &source_frame,
-                                                                              const std::string &target_frame,
-                                                                              const rclcpp::Time &time = rclcpp::Time(0),
-                                                                              const tf2::Duration timeout = tf2::durationFromSec(0.0))
-  {
-    std::optional<geometry_msgs::msg::TransformStamped> ret = std::nullopt;
-    try
-    {
-      ret = buffer.lookupTransform(target_frame, source_frame, time, timeout);
-    }
-    catch (tf2::LookupException &ex)
-    {
-      std::cerr << "[ERROR]" << ex.what() << std::endl;
-    }
-    catch (tf2::ExtrapolationException &ex)
-    {
-      std::cerr << "[ERROR]" << ex.what() << std::endl;
-    }
-    return ret;
-  }
-
-  template <typename POINT_TYPE = pcl::PointXYZ>
-  inline pcl::PointCloud<POINT_TYPE> voxelgrid_filter(const pcl::PointCloud<POINT_TYPE> &input_cloud, double lx, double ly, double lz)
-  {
-    pcl::PointCloud<POINT_TYPE> output_cloud;
-    pcl::ApproximateVoxelGrid<POINT_TYPE> sor;
-    sor.setInputCloud(input_cloud.makeShared());
-    sor.setLeafSize(lx, ly, lz);
-    sor.filter(output_cloud);
-    return output_cloud;
-  }
-
-  template <typename POINT_TYPE = pcl::PointXYZ>
-  inline pcl::PointCloud<POINT_TYPE> passthrough_filter(std::string field, const pcl::PointCloud<POINT_TYPE> &input_cloud, double min,
-                                                        double max)
-  {
-    pcl::PointCloud<POINT_TYPE> output_cloud;
-    pcl::PassThrough<POINT_TYPE> pass;
-    pass.setFilterFieldName(field);
-    pass.setFilterLimits(min, max);
-    pass.setInputCloud(input_cloud.makeShared()); // Set cloud
-    pass.filter(output_cloud);                    // Apply the filter
-    return output_cloud;
-  }
-
-  template <typename POINT_TYPE = pcl::PointXYZ>
-  inline std::pair<pcl::PointIndices::Ptr, pcl::ModelCoefficients::Ptr> ransac(const pcl::PointCloud<POINT_TYPE> &cloud, double threshold = 0.5)
-  {
-    // 平面検出
-    // 平面方程式と平面と検出された点のインデックス
-    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
-    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
-    // RANSACによる検出．
-    pcl::SACSegmentation<POINT_TYPE> seg;
-    seg.setOptimizeCoefficients(true);     // 外れ値の存在を前提とし最適化を行う
-    seg.setModelType(pcl::SACMODEL_PLANE); // モードを平面検出に設定
-    seg.setMethodType(pcl::SAC_RANSAC);    // 検出方法をRANSACに設定
-    seg.setDistanceThreshold(threshold);   // しきい値を設定
-    seg.setInputCloud(cloud.makeShared()); // 入力点群をセット
-    seg.segment(*inliers, *coefficients);  // 検出を行う
-    return {inliers, coefficients};
-  }
-
-  template <typename POINT_TYPE = pcl::PointXYZ>
-  inline pcl::PointCloud<POINT_TYPE> extract_cloud(const pcl::PointCloud<POINT_TYPE> &cloud, pcl::PointIndices::Ptr inliers,
-                                                   bool negative = false)
-  {
-    pcl::PointCloud<POINT_TYPE> extrac_cloud;
-    pcl::ExtractIndices<POINT_TYPE> extract;
-    if (inliers->indices.size() == 0)
-      return extrac_cloud;
-    extract.setInputCloud(cloud.makeShared());
-    extract.setIndices(inliers);
-    extract.setNegative(negative);
-    extract.filter(extrac_cloud);
-    return extrac_cloud;
-  }
-
-  template <typename POINT_TYPE = pcl::PointXYZ>
-  inline sensor_msgs::msg::PointCloud2 make_ros_pointcloud2(std_msgs::msg::Header header, const pcl::PointCloud<POINT_TYPE> &cloud)
-  {
-    sensor_msgs::msg::PointCloud2 cloud_msg;
-    pcl::toROSMsg(cloud, cloud_msg);
-    cloud_msg.header = header;
-    return cloud_msg;
   }
 };
